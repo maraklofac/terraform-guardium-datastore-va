@@ -1,0 +1,427 @@
+#***********************************************************************************************#
+#                                                                                               #
+# IBM Confidential                                                                              #
+# OCO Source Materials                                                                          #
+# © Copyright IBM Corp. 2002, 2026                                                              #
+# The source code for this program is not published or otherwise divested of its trade secrets, #
+# irrespective of what has been deposited with the U.S. Copyright Office.                       #
+#                                                                                               #
+#***********************************************************************************************#
+
+#=========================================================================================================
+# How to use this script:
+#
+# This script creates an App Registration (Service Principal) user in all databases on an Azure SQL
+# server instance using ENTRA ID AUTHENTICATION (browser-based login).
+#
+# RECOMMENDED: Use Azure Cloud Shell for simplest setup (modules pre-installed, already authenticated)
+#
+# This version is designed for CUSTOMER USE where:
+# - The customer has Entra ID admin rights on the SQL Server
+# - They want to automate creating App Registration users across many databases
+# - They can authenticate interactively (browser popup) once at the start
+# - The authentication token is reused for all databases (no repeated logins)
+# - Output can be redirected to a file for logging purposes
+#
+# IMPORTANT: This script requires the user running it to have:
+# - Entra ID admin rights on the SQL Server (or equivalent permissions)
+# - Ability to create users in each database
+# - Access to a web browser for initial authentication
+#
+# Prerequisites:
+# 1. An App Registration already exists in Azure AD/Entra ID
+# 2. You have Entra ID admin access to the SQL Server
+# 3. You can authenticate via browser (MFA supported)
+# 4. The App Registration name (display name from Azure AD) is known
+# 5. Azure SQL Server has Entra ID admin configured (Azure Portal → SQL Server → Microsoft Entra ID)
+#
+# The script will:
+# - Prompt for interactive authentication ONCE (browser popup)
+# - Acquire an access token that works for all databases
+# - List all databases on the server
+# - For each database, check if the user already exists
+# - Create the user if it doesn't exist
+# - Provide detailed logging of all operations
+#
+#=========================================================================================================
+# SETUP FOR AZURE CLOUD SHELL (RECOMMENDED - EASIEST):
+#
+# 1. Open Azure Cloud Shell (https://shell.azure.com) or click Cloud Shell icon in Azure Portal
+# 2. Upload this script using the upload button
+# 3. Edit the script: code gdmmonitor-AzureSQLDB-entra.ps1
+# 4. Modify $instance and $appRegistrationName parameters below
+# 5. Run: ./gdmmonitor-AzureSQLDB-entra.ps1
+#
+# Cloud Shell benefits:
+# - Already authenticated (no Connect-AzAccount needed)
+# - Modules pre-installed (Az, SqlServer)
+# - Firewall automatically configured
+# - No local setup required
+#
+#=========================================================================================================
+# SETUP FOR LOCAL WINDOWS (REQUIRES ADDITIONAL SETUP):
+#
+# Prerequisites:
+# - Windows 10/11 or Windows Server 2016+ with PowerShell 5.1+
+# - Administrator rights (for initial module installation only)
+# - Internet access to Azure
+#
+# Step 1: Verify PowerShell Version
+#   Open PowerShell and run: $PSVersionTable.PSVersion
+#   You need version 5.1 or higher
+#
+# Step 2: Install Required Modules (ONE-TIME SETUP - requires Admin)
+#   Open "Windows PowerShell (Admin)" from Start menu (right-click Start → Windows PowerShell (Admin))
+#   Run these commands:
+#     Install-Module -Name Az -Repository PSGallery -Force -AllowClobber
+#     Install-Module -Name SqlServer -Force -AllowClobber
+#
+#   Note: If you see "SqlServer commands already available" error, the -AllowClobber parameter
+#         is required to upgrade from older versions that don't support Entra ID authentication.
+#         This is critical - older versions will fail with "AccessToken parameter not found" error.
+#
+# Step 3: Configure Azure SQL Server Firewall
+#   In Azure Portal:
+#   - Go to your SQL Server → Networking (or Firewalls and virtual networks)
+#   - Add your public IP address (or click "Add client IP")
+#   - Save changes
+#
+# Step 4: Authenticate to Azure (REQUIRED EVERY TIME YOU RUN THE SCRIPT)
+#   Open regular "Windows PowerShell" (not Admin - close Admin window after Step 2)
+#
+#   For single-tenant environments:
+#     Connect-AzAccount
+#
+#   For multi-tenant environments (IMPORTANT - most common issue):
+#     Connect-AzAccount -TenantId "your-tenant-id-here"
+#
+#   To find your tenant ID:
+#     - Azure Portal → SQL Server → Overview → Directory (tenant) ID
+#     - Or run: Get-AzSubscription (shows all accessible tenants)
+#
+#   The browser will open for authentication. MFA (Microsoft Authenticator) is supported.
+#   You must authenticate to the SAME tenant where your SQL Server exists.
+#
+# Step 5: Run the Script
+#   cd C:\path\to\script
+#   .\gdmmonitor-AzureSQLDB-entra.ps1
+#
+#=========================================================================================================
+# TROUBLESHOOTING COMMON ISSUES:
+#
+# Error: "A parameter cannot be found that matches parameter name 'AccessToken'"
+#   Cause: SqlServer module is too old (pre-2018 version doesn't support Entra ID authentication)
+#   Fix: 1. Open PowerShell (Admin)
+#        2. Install-Module -Name SqlServer -Force -AllowClobber
+#        3. Close ALL PowerShell windows
+#        4. Open fresh PowerShell and verify: Get-Module -ListAvailable SqlServer
+#           (Should show version 21.1.18080 or higher)
+#
+# Error: "The server is not currently configured to accept this token"
+#   Cause 1: Wrong tenant - you're authenticated to a different tenant than where SQL Server exists
+#   Fix: 1. Disconnect-AzAccount
+#        2. Connect-AzAccount -TenantId "correct-tenant-id"
+#           (Get tenant ID from Azure Portal → SQL Server → Overview)
+#
+#   Cause 2: Entra ID admin not configured on SQL Server
+#   Fix: Azure Portal → SQL Server → Microsoft Entra ID → Set admin
+#
+# Error: "Login failed" or connection timeout
+#   Cause: Firewall blocking your IP address
+#   Fix: Azure Portal → SQL Server → Networking → Add your client IP address
+#
+#=========================================================================================================
+# USAGE:
+#
+# Modify the following input parameters: $instance, $appRegistrationName
+# Then run: .\gdmmonitor-AzureSQLDB-entra.ps1
+#
+# To redirect output to a file:
+#   .\gdmmonitor-AzureSQLDB-entra.ps1 > output.log 2>&1
+#
+#=========================================================================================================
+
+
+# Input parameters - MODIFY THESE VALUES
+$instance = '<your instance name>'                           # e.g., 'myserver.database.windows.net'
+$appRegistrationName = '<app registration display name>'     # Display name from Azure AD (e.g., 'my-app-reg1')
+
+# Optional: Set to $true to include system databases (tempdb, model, msdb)
+$includeSystemDatabases = $false
+
+# Optional: Set to $true to see what would happen without making changes
+$dryRun = $false
+
+
+Write-Output "========================================"
+Write-Output "Azure SQL App Registration User Creator"
+Write-Output "Entra ID Authentication Mode"
+Write-Output "========================================"
+Write-Output ""
+Write-Output "Server Instance: $instance"
+Write-Output "App Registration Name: $appRegistrationName"
+if ($dryRun) {
+    Write-Output "Mode: DRY RUN (no changes will be made)"
+} else {
+    Write-Output "Mode: LIVE (changes will be applied)"
+}
+Write-Output ""
+Write-Output "Authentication: Interactive Entra ID"
+Write-Output "  - Cloud Shell: Uses existing session (no popup)"
+Write-Output "  - Local PowerShell: Browser popup for sign-in"
+Write-Output "  - Authentication happens ONCE at the start"
+Write-Output "  - Token is reused for all databases"
+Write-Output "  - MFA is supported"
+Write-Output ""
+
+# Install SqlServer module if needed
+if (-not (Get-Module -ListAvailable -Name SqlServer)) {
+    Write-Output "Installing SqlServer module..."
+    Install-Module -Name SqlServer -Force -Scope CurrentUser
+    Write-Output "SqlServer module installed."
+} else {
+    Write-Output "SqlServer module already available."
+}
+
+Write-Output ""
+Write-Output "Step 1: Authenticating..."
+Write-Output "You may be prompted to sign in via browser (if not already authenticated)."
+Write-Output ""
+
+try {
+    # Get access token using interactive authentication
+    # This will open a browser window for the user to authenticate
+    # The token is valid for all databases on the server
+    
+    $tokenResponse = Get-AzAccessToken -ResourceUrl "https://database.windows.net/" -ErrorAction Stop
+    $accessToken = $tokenResponse.Token
+    
+    Write-Output "[SUCCESS] Authentication successful!"
+    Write-Output "  Account: $($tokenResponse.UserId)"
+    Write-Output "  Token expires: $($tokenResponse.ExpiresOn.LocalDateTime)"
+    Write-Output ""
+    
+} catch {
+    Write-Output ""
+    Write-Output "[ERROR] Authentication failed."
+    Write-Output "Error Details: $($_.Exception.Message)"
+    Write-Output ""
+    Write-Output "Please ensure:"
+    Write-Output "  - You are logged into Azure (run 'Connect-AzAccount' if needed)"
+    Write-Output "  - You have access to the SQL Server"
+    Write-Output "  - Your browser allows popups"
+    Write-Output ""
+    Write-Output "If running in Azure Cloud Shell, you should already be authenticated."
+    Write-Output "If running locally, run 'Connect-AzAccount' first."
+    Write-Output ""
+    exit 1
+}
+
+Write-Output "Step 2: Connecting to server and retrieving database list..."
+Write-Output ""
+
+try {
+    # Query all accessible databases on the server using the access token
+    # Build query to get databases
+    $databaseQuery = "SELECT name FROM sys.databases WHERE state = 0"
+    
+    if (-not $includeSystemDatabases) {
+        $databaseQuery += " AND name NOT IN ('tempdb', 'model', 'msdb')"
+    }
+    
+    $databaseQuery += " ORDER BY name"
+    
+    # Get list of databases using access token
+    # Use 60 second timeouts for connection and query execution
+    $databases = Invoke-Sqlcmd -ServerInstance $instance -Database master -AccessToken $accessToken -Query $databaseQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+    
+    if ($databases.Count -eq 0) {
+        Write-Output "[ERROR] No accessible databases found on this server."
+        Write-Output ""
+        exit 1
+    }
+    
+    Write-Output "Found $($databases.Count) database(s) to process:"
+    foreach ($db in $databases) {
+        Write-Output "  - $($db.name)"
+    }
+    Write-Output ""
+    
+} catch {
+    Write-Output ""
+    Write-Output "[ERROR] Failed to connect to server or retrieve database list."
+    Write-Output "Error Details: $($_.Exception.Message)"
+    Write-Output ""
+    Write-Output "Please verify:"
+    Write-Output "  - Server instance name is correct"
+    Write-Output "  - You have permissions to access the server"
+    Write-Output "  - Firewall rules allow your connection"
+    Write-Output "  - You are logged in with an account that has admin rights"
+    Write-Output ""
+    exit 1
+}
+
+Write-Output "Step 3: Creating gdmmonitor role and App Registration user in each database..."
+Write-Output ""
+
+# Initialize counters for summary
+$successCount = 0
+$alreadyExistsCount = 0
+$errorCount = 0
+$skippedCount = 0
+$roleCreatedCount = 0
+$roleExistedCount = 0
+
+# Process each database
+foreach ($database in $databases) {
+    $dbName = $database.name
+    
+    Write-Output "Processing: $dbName"
+    
+    try {
+        # Step 1: Create gdmmonitor role if it doesn't exist (skip for master)
+        if ($dbName -ne 'master') {
+            $checkRoleQuery = "SELECT name FROM sys.database_principals WHERE name = 'gdmmonitor' AND type = 'R'"
+            $existingRole = Invoke-Sqlcmd -ServerInstance $instance -Database $dbName -AccessToken $accessToken -Query $checkRoleQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+            
+            if ($existingRole) {
+                Write-Output "  [INFO] Role [gdmmonitor] already exists"
+                $roleExistedCount++
+            } else {
+                if ($dryRun) {
+                    Write-Output "  [DRY RUN] Would create role [gdmmonitor]"
+                } else {
+                    # Create the role
+                    $createRoleQuery = "CREATE ROLE [gdmmonitor];"
+                    Invoke-Sqlcmd -ServerInstance $instance -Database $dbName -AccessToken $accessToken -Query $createRoleQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+                    Write-Output "  [SUCCESS] Created role [gdmmonitor]"
+                    $roleCreatedCount++
+                }
+            }
+            
+            # Step 2: Grant permissions to the role (only if not dry run)
+            if (-not $dryRun) {
+                $grantPermissionsQuery = @"
+GRANT SELECT ON sys.all_objects TO gdmmonitor;
+GRANT SELECT ON sys.database_firewall_rules TO gdmmonitor;
+GRANT SELECT ON sys.database_permissions TO gdmmonitor;
+GRANT SELECT ON sys.database_principals TO gdmmonitor;
+GRANT SELECT ON sys.database_role_members TO gdmmonitor;
+GRANT SELECT ON sys.schemas TO gdmmonitor;
+GRANT SELECT ON sys.sql_modules TO gdmmonitor;
+GRANT SELECT ON sys.symmetric_keys TO gdmmonitor;
+GRANT VIEW DATABASE STATE TO gdmmonitor;
+GRANT VIEW DEFINITION TO gdmmonitor;
+"@
+                Invoke-Sqlcmd -ServerInstance $instance -Database $dbName -AccessToken $accessToken -Query $grantPermissionsQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+                Write-Output "  [SUCCESS] Granted permissions to role [gdmmonitor]"
+            } elseif (-not $existingRole) {
+                Write-Output "  [DRY RUN] Would grant permissions to role [gdmmonitor]"
+            }
+        }
+        
+        # Step 3: Check if user already exists
+        $checkUserQuery = "SELECT name FROM sys.database_principals WHERE name = '$appRegistrationName' AND type = 'E'"
+        $existingUser = Invoke-Sqlcmd -ServerInstance $instance -Database $dbName -AccessToken $accessToken -Query $checkUserQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+        
+        if ($existingUser) {
+            Write-Output "  [INFO] User [$appRegistrationName] already exists"
+            $alreadyExistsCount++
+            
+            # Step 4: Add user to role if not already a member (skip for master)
+            if ($dbName -ne 'master' -and -not $dryRun) {
+                $checkMemberQuery = @"
+SELECT 1 FROM sys.database_role_members rm
+JOIN sys.database_principals role ON rm.role_principal_id = role.principal_id
+JOIN sys.database_principals member ON rm.member_principal_id = member.principal_id
+WHERE role.name = 'gdmmonitor' AND member.name = '$appRegistrationName'
+"@
+                $isMember = Invoke-Sqlcmd -ServerInstance $instance -Database $dbName -AccessToken $accessToken -Query $checkMemberQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+                
+                if (-not $isMember) {
+                    $addToRoleQuery = "ALTER ROLE [gdmmonitor] ADD MEMBER [$appRegistrationName];"
+                    Invoke-Sqlcmd -ServerInstance $instance -Database $dbName -AccessToken $accessToken -Query $addToRoleQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+                    Write-Output "  [SUCCESS] Added user [$appRegistrationName] to role [gdmmonitor]"
+                } else {
+                    Write-Output "  [INFO] User [$appRegistrationName] already member of role [gdmmonitor]"
+                }
+            }
+        } else {
+            if ($dryRun) {
+                Write-Output "  [DRY RUN] Would create user [$appRegistrationName]"
+                if ($dbName -ne 'master') {
+                    Write-Output "  [DRY RUN] Would add user to role [gdmmonitor]"
+                }
+                $skippedCount++
+            } else {
+                # Create the user
+                $createUserQuery = "CREATE USER [$appRegistrationName] FROM EXTERNAL PROVIDER;"
+                Invoke-Sqlcmd -ServerInstance $instance -Database $dbName -AccessToken $accessToken -Query $createUserQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+                Write-Output "  [SUCCESS] Created user [$appRegistrationName]"
+                
+                # Add user to role (skip for master)
+                if ($dbName -ne 'master') {
+                    $addToRoleQuery = "ALTER ROLE [gdmmonitor] ADD MEMBER [$appRegistrationName];"
+                    Invoke-Sqlcmd -ServerInstance $instance -Database $dbName -AccessToken $accessToken -Query $addToRoleQuery -ConnectionTimeout 60 -QueryTimeout 60 -ErrorAction Stop
+                    Write-Output "  [SUCCESS] Added user [$appRegistrationName] to role [gdmmonitor]"
+                }
+                
+                $successCount++
+            }
+        }
+        
+    } catch {
+        Write-Output "  [ERROR] $($_.Exception.Message)"
+        $errorCount++
+    }
+    
+    Write-Output ""
+}
+
+# Display summary
+Write-Output "========================================"
+Write-Output "Summary"
+Write-Output "========================================"
+Write-Output "Total databases processed: $($databases.Count)"
+Write-Output ""
+Write-Output "Role [gdmmonitor]:"
+Write-Output "  Created: $roleCreatedCount"
+Write-Output "  Already existed: $roleExistedCount"
+Write-Output ""
+Write-Output "User [$appRegistrationName]:"
+
+if ($dryRun) {
+    Write-Output "  Dry run - would create: $skippedCount"
+} else {
+    Write-Output "  Created: $successCount"
+}
+
+Write-Output "  Already existed: $alreadyExistsCount"
+Write-Output ""
+Write-Output "Errors encountered: $errorCount"
+Write-Output ""
+
+if ($dryRun) {
+    Write-Output "This was a DRY RUN. Set `$dryRun = `$false to apply changes."
+    Write-Output ""
+}
+
+if ($errorCount -gt 0) {
+    Write-Output "[WARNING] Some operations failed. Review the errors above."
+    Write-Output "Common issues:"
+    Write-Output "  - Account lacks ALTER ANY USER permission in some databases"
+    Write-Output "  - App Registration name is incorrect (use display name, not client ID)"
+    Write-Output "  - Database is in a restricted state"
+    Write-Output "  - Access token expired (script took too long)"
+    Write-Output "  - Connection or query timeout (script uses 60 second timeouts)"
+    Write-Output ""
+}
+
+if ($successCount -gt 0 -or $alreadyExistsCount -gt 0) {
+    Write-Output "[SUCCESS] App Registration user is now available in $($successCount + $alreadyExistsCount) database(s)"
+    Write-Output ""
+}
+
+Write-Output "Script completed."
+
+# Made with Bob

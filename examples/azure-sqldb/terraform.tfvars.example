@@ -1,0 +1,129 @@
+#
+# Copyright IBM Corp. 2026
+# SPDX-License-Identifier: Apache-2.0
+#
+
+# Azure SQL DB with VA Example — Example Variable Values
+# Copy to terraform.tfvars and fill in your values before running terraform apply.
+
+#------------------------------------------------------------------------------
+# General Configuration
+#------------------------------------------------------------------------------
+location            = "canadacentral"
+name_prefix         = "my-sqldb-monitoring"
+resource_group_name = "my-sqldb-rg"
+
+#------------------------------------------------------------------------------
+# Network Configuration
+#
+# To find your VNet name:
+#   az network vnet list --resource-group <your-rg> --output table
+#
+# The function_subnet_address_prefix must not overlap existing subnets.
+#   az network vnet subnet list --resource-group <rg> --vnet-name <vnet> --output table
+#------------------------------------------------------------------------------
+vnet_name                      = "my-sqldb-vnet"
+function_subnet_address_prefix = "10.0.3.0/24"
+
+#------------------------------------------------------------------------------
+# Firewall Configuration
+#
+# enable_public_access: true for testing, false for production (use Private Link)
+# guardium_hostname: hostname or IP of your Guardium server
+#
+# To find your Guardium outbound IP:
+#   From the Guardium server: curl ifconfig.me
+#------------------------------------------------------------------------------
+enable_public_access = true
+guardium_hostname    = "guardium.example.com"
+
+additional_firewall_rules = {
+  "AllowCorporateNetwork" = {
+    start_ip = "10.0.0.0"
+    end_ip   = "10.255.255.255"
+  }
+}
+
+#------------------------------------------------------------------------------
+# Azure SQL Server Configuration
+#
+# To find your SQL Server name and FQDN:
+#   az sql server list --resource-group <your-rg> --output table
+#   az sql server show --name <server-name> --resource-group <rg> \
+#     --query "fullyQualifiedDomainName" -o tsv
+#------------------------------------------------------------------------------
+sql_server_name = "my-sql-server"
+db_host         = "my-sql-server.database.windows.net"
+db_port         = 1433
+
+#------------------------------------------------------------------------------
+# Entra ID — Admin App Registration
+#
+# This App Registration must be set as the Microsoft Entra ID administrator
+# on the SQL Server (Azure Portal → SQL Server → Microsoft Entra ID → Set admin).
+#
+# To find tenant ID:
+#   az account show --query "tenantId" -o tsv
+#
+# To find App Registration client ID:
+#   Azure Portal → App registrations → <your-admin-app-reg> → Overview → Application (client) ID
+#------------------------------------------------------------------------------
+tenant_id           = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+admin_client_id     = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+admin_client_secret = "your-admin-client-secret-value"
+
+#------------------------------------------------------------------------------
+# Entra ID — Monitoring App Registration
+#
+# Create a separate App Registration for Guardium monitoring (least-privilege).
+# Guardium will use its Client ID as username and Client Secret as password
+# with authentication=ActiveDirectoryServicePrincipal.
+#
+# The Function will create a user for this App Registration in every database
+# and assign it the gdmmonitor role (read-only VA permissions).
+#------------------------------------------------------------------------------
+monitor_client_id             = "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+monitor_client_secret         = "your-monitor-client-secret-value"
+monitor_app_registration_name = "app-reg-gdmmonitor"
+
+#------------------------------------------------------------------------------
+# Guardium Data Protection Configuration
+#------------------------------------------------------------------------------
+gdp_server    = "guardium.example.com"
+gdp_port      = "8443"
+gdp_username  = "admin"
+gdp_password  = "YourGuardiumPassword"
+client_id     = "client1"
+client_secret = "your-guardium-oauth-client-secret"
+
+#------------------------------------------------------------------------------
+# Datasource Configuration
+#------------------------------------------------------------------------------
+datasource_name        = "azure-sqldb-va"
+datasource_description = "Azure SQL DB data source onboarded via Terraform"
+application            = "Security Assessment"
+severity_level         = "MED"
+
+#------------------------------------------------------------------------------
+# Vulnerability Assessment Schedule
+#------------------------------------------------------------------------------
+enable_vulnerability_assessment = true
+assessment_schedule             = "weekly"
+assessment_day                  = "Monday"
+assessment_time                 = "02:00"
+
+#------------------------------------------------------------------------------
+# Notification Configuration
+#------------------------------------------------------------------------------
+enable_notifications  = true
+notification_emails   = ["your-email@example.com"]
+notification_severity = "HIGH"
+
+#------------------------------------------------------------------------------
+# Tags
+#------------------------------------------------------------------------------
+tags = {
+  Purpose     = "guardium-va-config"
+  Environment = "development"
+  Owner       = "your-email@example.com"
+}
