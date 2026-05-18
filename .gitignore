@@ -36,6 +36,9 @@ terraform.rc
 # SSL/TLS Certificate files
 *.pem
 
+# Temporary files and scripts
+/tmp/
+
 # Local editors/macos files
 .DS_Store
 .idea
